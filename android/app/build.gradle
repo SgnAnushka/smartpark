@@ -30,6 +30,12 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+
+        def apiKey = System.getenv("API_KEY") ?: "default_api_key"
+        def appName = "android.app.Application"
+        manifestPlaceholders = [applicationName: appName,
+                                API_KEY: apiKey,
+                                ]
     }
 
     buildTypes {
