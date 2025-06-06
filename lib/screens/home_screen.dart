@@ -1,13 +1,16 @@
 import 'dart:async';
+import 'dart:convert';
+import 'package:http/http.dart' as http;
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:firebase_database/firebase_database.dart';
 import '../model/parkingspot_model.dart';
-import '../apis/parking_api.dart';
 import '/screens/bookhis_screen.dart';
 import 'booking_screen.dart';
+import 'dart:math' as math;
 
 class HomeScreen extends StatefulWidget {
   final User user;
@@ -33,7 +36,7 @@ class _HomeScreenState extends State<HomeScreen> {
   List<ParkingSpot> allParkingSpots = [];
   List<ParkingSpot> nearbyParkingSpots = [];
   StreamSubscription<Position>? positionStreamSubscription;
-  StreamSubscription? firebaseSub;
+  StreamSubscription<DatabaseEvent>? firebaseSub;
 
   Set<Marker> markers = {};
   Set<Polyline> polylines = {};
@@ -48,6 +51,7 @@ class _HomeScreenState extends State<HomeScreen> {
     _listenToParkingSpots();
     _startBookingExpiryTimer();
     _refreshBookingState();
+    _restoreBookingStateFromFirebase();
   }
 
   @override
@@ -66,9 +70,69 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _refreshBookingState() async {
-    await ParkingApi.checkAndHandleBookingExpiration();
+    await checkAndHandleBookingExpiration();
     await _checkBooking();
     setState(() {});
+  }
+  Future<void> _restoreBookingStateFromFirebase() async {
+    final prefs = await SharedPreferences.getInstance();
+    final userId = FirebaseAuth.instance.currentUser?.uid;
+    if (userId == null || prefs.getString('booked_spot_key') != null) return;
+
+    final activeBooking = await FirebaseDatabase.instance
+        .ref('user_booking_history/$userId')
+        .orderByChild('status')
+        .equalTo('active')
+        .once();
+
+    if (activeBooking.snapshot.value != null) {
+      final bookingEntry = (activeBooking.snapshot.value as Map<dynamic, dynamic>).entries.first;
+      final bookingData = bookingEntry.value as Map<dynamic, dynamic>;
+      await prefs.setString('booked_spot_key', bookingData['slotKey']);
+      await prefs.setString('last_booking_id', bookingEntry.key);
+      await prefs.setString('booked_spot_name', bookingData['slotName']);
+      await prefs.setDouble('booked_spot_lat', bookingData['slotLat']);
+      await prefs.setDouble('booked_spot_lng', bookingData['slotLng']);
+      await prefs.setInt('booked_spot_capacity', bookingData['capacity'] ?? 0);
+      await prefs.setInt('booking_end_time', bookingData['endTime']);
+    }
+  }
+
+
+  Future<void> checkAndHandleBookingExpiration() async {
+    final prefs = await SharedPreferences.getInstance();
+    final bookingEndTime = prefs.getInt('booking_end_time');
+    final spotKey = prefs.getString('booked_spot_key');
+    final bookingId = prefs.getString('last_booking_id');
+    final userId = FirebaseAuth.instance.currentUser?.uid;
+
+    if (bookingEndTime != null && spotKey != null && userId != null && bookingId != null) {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      if (now >= bookingEndTime) {
+        // 1. Restore capacity
+        final ref = FirebaseDatabase.instance.ref('parking_lots/$spotKey/capacity');
+        final capSnap = await ref.get();
+        int cap = capSnap.value is int ? capSnap.value as int : 0;
+        await ref.set(cap + 1);
+
+        // 2. Update booking history status to 'completed'
+        final bookingRef = FirebaseDatabase.instance
+            .ref('user_booking_history/$userId/$bookingId');
+        await bookingRef.update({
+          'status': 'completed',
+          'completedAt': now,
+        });
+
+        // 3. Clear booking state
+        await prefs.remove('booked_spot_key');
+        await prefs.remove('booked_spot_name');
+        await prefs.remove('booked_spot_lat');
+        await prefs.remove('booked_spot_lng');
+        await prefs.remove('booked_spot_capacity');
+        await prefs.remove('booking_end_time');
+        await prefs.remove('last_booking_id');
+      }
+    }
   }
 
   Future<void> _checkBooking() async {
@@ -100,7 +164,22 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _listenToParkingSpots() {
-    firebaseSub = ParkingApi.listenToParkingSpots((spots) {
+    final ref = FirebaseDatabase.instance.ref('parking_lots');
+    firebaseSub = ref.onValue.listen((DatabaseEvent event) {
+      final data = event.snapshot.value as Map<dynamic, dynamic>?;
+      if (data == null) {
+        setState(() {
+          allParkingSpots = [];
+        });
+        _updateNearbyParkingSpots(forceNearest: true);
+        return;
+      }
+      final spots = <ParkingSpot>[];
+      data.forEach((key, value) {
+        if (value is Map<dynamic, dynamic>) {
+          spots.add(ParkingSpot.fromMap(value, key));
+        }
+      });
       setState(() {
         allParkingSpots = spots;
       });
@@ -115,12 +194,29 @@ class _HomeScreenState extends State<HomeScreen> {
       errorMessage = null;
     });
     try {
-      currentLocation = await ParkingApi.getCurrentLocation();
+      await Geolocator.requestPermission();
+      Position position = await Geolocator.getCurrentPosition(
+          desiredAccuracy: LocationAccuracy.high);
       setState(() {
+        currentLocation = LatLng(position.latitude, position.longitude);
         isLoading = false;
       });
       _updateNearbyParkingSpots(forceNearest: true);
-      // Add location stream logic if needed
+      positionStreamSubscription = Geolocator.getPositionStream(
+        locationSettings: LocationSettings(
+          accuracy: LocationAccuracy.high,
+          distanceFilter: 10,
+        ),
+      ).listen((Position newPosition) {
+        setState(() {
+          currentLocation = LatLng(newPosition.latitude, newPosition.longitude);
+        });
+        _updateNearbyParkingSpots();
+        if (selectedSpot != null) {
+          _getRoute(currentLocation!, selectedSpot!.location);
+        }
+        _updateInstructionIndex();
+      });
     } catch (e) {
       setState(() {
         currentLocation = LatLng(24.953514, 84.011787);
@@ -135,7 +231,7 @@ class _HomeScreenState extends State<HomeScreen> {
     if (currentLocation == null) return;
     setState(() {
       nearbyParkingSpots = allParkingSpots.where((spot) {
-        return ParkingApi.calculateDistance(currentLocation!, spot.location) <= searchRadius && spot.isAvailable;
+        return _calculateDistance(currentLocation!, spot.location) <= searchRadius && spot.isAvailable;
       }).toList();
     });
 
@@ -161,7 +257,7 @@ class _HomeScreenState extends State<HomeScreen> {
     ParkingSpot? closest;
     double minDist = double.infinity;
     for (var spot in nearbyParkingSpots) {
-      double dist = ParkingApi.calculateDistance(currentLocation!, spot.location);
+      double dist = _calculateDistance(currentLocation!, spot.location);
       if (dist < minDist) {
         minDist = dist;
         closest = spot;
@@ -191,15 +287,83 @@ class _HomeScreenState extends State<HomeScreen> {
     _getRoute(currentLocation!, spot.location);
   }
 
+  double _calculateDistance(LatLng a, LatLng b) {
+    const p = 0.017453292519943295;
+    final c = (double x) => math.cos(x);
+    final d = (double x) => math.sin(x);
+    final lat1 = a.latitude * p;
+    final lat2 = b.latitude * p;
+    final a1 = d((lat2 - lat1) / 2);
+    final a2 = d((b.longitude - a.longitude) * p / 2);
+    final a3 = a1 * a1 + c(lat1) * c(lat2) * a2 * a2;
+    return 12742 * math.asin(math.sqrt(a3)) * 1000; // in meters
+  }
+
   Future<void> _getRoute(LatLng start, LatLng end) async {
     const apiKey = String.fromEnvironment('API_KEY');
-    final points = await ParkingApi.getRoute(start, end, apiKey);
-    setState(() {
-      routePoints = points;
-      // navigationInstructions logic can be added here if needed
-      isRouting = false;
-    });
-    _updatePolylines();
+    final url =
+        'https://maps.googleapis.com/maps/api/directions/json?origin=${start.latitude},${start.longitude}&destination=${end.latitude},${end.longitude}&mode=driving&key=$apiKey';
+    try {
+      final response = await http.get(Uri.parse(url));
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        if (data['routes'] != null && data['routes'].isNotEmpty) {
+          final route = data['routes'][0];
+          final polyline = route['overview_polyline']['points'];
+          final List<LatLng> points = _decodePolyline(polyline);
+          setState(() {
+            routePoints = points;
+            isRouting = false;
+          });
+          _updatePolylines();
+        } else {
+          setState(() {
+            routePoints = [];
+            isRouting = false;
+            errorMessage = "No route found.";
+          });
+        }
+      } else {
+        setState(() {
+          routePoints = [];
+          isRouting = false;
+          errorMessage = "Failed to fetch route.";
+        });
+      }
+    } catch (e) {
+      setState(() {
+        routePoints = [];
+        isRouting = false;
+        errorMessage = "Error fetching route.";
+      });
+    }
+  }
+
+  List<LatLng> _decodePolyline(String polyline) {
+    List<LatLng> result = [];
+    int index = 0, len = polyline.length;
+    int lat = 0, lng = 0;
+    while (index < len) {
+      int b, shift = 0, resultInt = 0;
+      do {
+        b = polyline.codeUnitAt(index++) - 63;
+        resultInt |= (b & 0x1f) << shift;
+        shift += 5;
+      } while (b >= 0x20);
+      int dlat = ((resultInt & 1) != 0 ? ~(resultInt >> 1) : (resultInt >> 1));
+      lat += dlat;
+      shift = 0;
+      resultInt = 0;
+      do {
+        b = polyline.codeUnitAt(index++) - 63;
+        resultInt |= (b & 0x1f) << shift;
+        shift += 5;
+      } while (b >= 0x20);
+      int dlng = ((resultInt & 1) != 0 ? ~(resultInt >> 1) : (resultInt >> 1));
+      lng += dlng;
+      result.add(LatLng(lat / 1E5, lng / 1E5));
+    }
+    return result;
   }
 
   void _updateMarkers() {
@@ -304,7 +468,6 @@ class _HomeScreenState extends State<HomeScreen> {
             polylines: polylines,
             onMapCreated: (controller) => mapController = controller,
           ),
-          // Radius selector as horizontal scrollable chips (hidden when booked)
           if (bookedSpotKey == null)
             Positioned(
               left: 0,
@@ -331,7 +494,6 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
               ),
             ),
-          // Persistent bottom sheet for parking spots
           Align(
             alignment: Alignment.bottomCenter,
             child: Container(
@@ -486,3 +648,4 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 }
+

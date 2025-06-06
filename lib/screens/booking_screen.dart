@@ -19,9 +19,34 @@ class _BookingScreenState extends State<BookingScreen> {
   final TextEditingController _controller = TextEditingController();
 
   @override
+  void initState() {
+    super.initState();
+    _restoreBookingState();
+  }
+
+  @override
   void dispose() {
     _controller.dispose();
     super.dispose();
+  }
+
+  Future<void> _restoreBookingState() async {
+    final prefs = await SharedPreferences.getInstance();
+    final userId = FirebaseAuth.instance.currentUser?.uid;
+    if (userId == null || prefs.getString('booked_spot_key') != null) return;
+
+    final activeBooking = await FirebaseDatabase.instance
+        .ref('user_booking_history/$userId')
+        .orderByChild('status')
+        .equalTo('active')
+        .once();
+
+    if (activeBooking.snapshot.value != null) {
+      final bookingEntry = (activeBooking.snapshot.value as Map<dynamic, dynamic>).entries.first;
+      final bookingData = bookingEntry.value as Map<dynamic, dynamic>;
+      await prefs.setString('booked_spot_key', bookingData['slotKey']);
+      await prefs.setString('last_booking_id', bookingEntry.key);
+    }
   }
 
   Future<void> _bookSpot() async {
@@ -81,6 +106,7 @@ class _BookingScreenState extends State<BookingScreen> {
     await Future.delayed(const Duration(seconds: 1));
     Navigator.pop(context, true);
   }
+
 
   Future<void> _cancelBooking() async {
     setState(() { isProcessing = true; });
