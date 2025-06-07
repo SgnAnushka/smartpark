@@ -74,6 +74,7 @@ class _HomeScreenState extends State<HomeScreen> {
     await _checkBooking();
     setState(() {});
   }
+
   Future<void> _restoreBookingStateFromFirebase() async {
     final prefs = await SharedPreferences.getInstance();
     final userId = FirebaseAuth.instance.currentUser?.uid;
@@ -97,7 +98,6 @@ class _HomeScreenState extends State<HomeScreen> {
       await prefs.setInt('booking_end_time', bookingData['endTime']);
     }
   }
-
 
   Future<void> checkAndHandleBookingExpiration() async {
     final prefs = await SharedPreferences.getInstance();
@@ -178,8 +178,8 @@ class _HomeScreenState extends State<HomeScreen> {
       data.forEach((key, value) {
         if (value is Map<dynamic, dynamic>) {
           spots.add(ParkingSpot.fromMap(value, key));
-        }
-      });
+          }
+          });
       setState(() {
         allParkingSpots = spots;
       });
@@ -196,7 +196,8 @@ class _HomeScreenState extends State<HomeScreen> {
     try {
       await Geolocator.requestPermission();
       Position position = await Geolocator.getCurrentPosition(
-          desiredAccuracy: LocationAccuracy.high);
+        desiredAccuracy: LocationAccuracy.high,
+      );
       setState(() {
         currentLocation = LatLng(position.latitude, position.longitude);
         isLoading = false;
@@ -234,7 +235,6 @@ class _HomeScreenState extends State<HomeScreen> {
         return _calculateDistance(currentLocation!, spot.location) <= searchRadius && spot.isAvailable;
       }).toList();
     });
-
     if (bookedSpotKey == null) {
       if (forceNearest || selectedSpot == null || !nearbyParkingSpots.contains(selectedSpot)) {
         if (nearbyParkingSpots.isNotEmpty) {
@@ -384,12 +384,13 @@ class _HomeScreenState extends State<HomeScreen> {
           markerId: MarkerId(spot.name),
           position: spot.location,
           icon: BitmapDescriptor.defaultMarkerWithHue(
-              spot == selectedSpot ? BitmapDescriptor.hueOrange : BitmapDescriptor.hueGreen),
+            spot == selectedSpot ? BitmapDescriptor.hueOrange : BitmapDescriptor.hueGreen,
+          ),
           infoWindow: InfoWindow(
             title: spot.name,
             snippet: 'Capacity: ${spot.capacity}',
             onTap: () {
-              if (bookedSpotKey == null) _onManualSpotSelect(spot);
+              if (bookedSpotKey != null) _onManualSpotSelect(spot);
             },
           ),
         ),
@@ -423,12 +424,20 @@ class _HomeScreenState extends State<HomeScreen> {
     await FirebaseAuth.instance.signOut();
   }
 
+  // ... (all your imports and class/state definitions above remain the same)
+
   @override
   Widget build(BuildContext context) {
-    final mq = MediaQuery.of(context);
     return Scaffold(
       appBar: AppBar(
+        backgroundColor: Colors.grey[900]?.withOpacity(0.97),
         title: const Text("Smart Parking"),
+        iconTheme: const IconThemeData(color: Colors.teal),
+        titleTextStyle: const TextStyle(
+          color: Colors.teal,
+          fontSize: 20,
+          //fontWeight: FontWeight.bold,
+        ),
         actions: [
           IconButton(
             icon: const Icon(Icons.logout),
@@ -449,10 +458,11 @@ class _HomeScreenState extends State<HomeScreen> {
             icon: const Icon(Icons.refresh),
             onPressed: _refreshBookingState,
             tooltip: "Refresh parking spots",
-          )
+          ),
         ],
       ),
-      body: isLoading || currentLocation == null
+
+        body: isLoading || currentLocation == null
           ? const Center(child: CircularProgressIndicator())
           : Stack(
         children: [
@@ -468,159 +478,265 @@ class _HomeScreenState extends State<HomeScreen> {
             polylines: polylines,
             onMapCreated: (controller) => mapController = controller,
           ),
-          if (bookedSpotKey == null)
-            Positioned(
-              left: 0,
-              right: 0,
-              bottom: 210,
-              child: SizedBox(
-                height: 50,
-                child: ListView(
-                  scrollDirection: Axis.horizontal,
-                  padding: const EdgeInsets.symmetric(horizontal: 12),
-                  children: [200, 500, 1000, 2000, 3000].map((r) => Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 8),
-                    child: ChoiceChip(
-                      label: Text('$r m'),
-                      selected: searchRadius == r.toDouble(),
-                      onSelected: (_) {
-                        setState(() {
-                          searchRadius = r.toDouble();
-                        });
-                        _updateNearbyParkingSpots(forceNearest: true);
-                      },
-                    ),
-                  )).toList(),
-                ),
-              ),
-            ),
-          Align(
-            alignment: Alignment.bottomCenter,
+          // Bottom pop-up (always visible)
+          Positioned(
+            bottom: 0,
+            left: 0,
+            right: 0,
             child: Container(
-              padding: EdgeInsets.only(
-                  bottom: mq.padding.bottom > 0 ? mq.padding.bottom : 12, top: 8),
               decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: const BorderRadius.vertical(top: Radius.circular(22)),
+                color: Colors.grey[900]?.withOpacity(0.97),
+                borderRadius: const BorderRadius.vertical(top: Radius.circular(14)),
                 boxShadow: [
-                  const BoxShadow(
-                    color: Colors.black12,
-                    blurRadius: 14,
-                    offset: Offset(0, -2),
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.2),
+                    blurRadius: 6,
+                    offset: const Offset(0, -2),
                   ),
                 ],
               ),
+              padding: const EdgeInsets.only(bottom: 12, top: 8),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Container(
-                    width: 40,
-                    height: 5,
-                    margin: const EdgeInsets.only(bottom: 8),
-                    decoration: BoxDecoration(
-                      color: Colors.indigo[100],
-                      borderRadius: BorderRadius.circular(4),
-                    ),
-                  ),
-                  if (bookedSpotKey == null)
-                    SizedBox(
-                      height: 60,
-                      child: ListView.separated(
-                        scrollDirection: Axis.horizontal,
-                        padding: const EdgeInsets.symmetric(horizontal: 12),
-                        itemCount: nearbyParkingSpots.length,
-                        separatorBuilder: (_, __) => const SizedBox(width: 8),
-                        itemBuilder: (context, idx) {
-                          final spot = nearbyParkingSpots[idx];
-                          final isSelected = spot == selectedSpot;
-                          return ChoiceChip(
-                            label: Text('${spot.name} (${spot.capacity})'),
-                            selected: isSelected,
-                            selectedColor: Colors.orange,
-                            backgroundColor: Colors.indigo[50],
-                            labelStyle: TextStyle(
-                              color: isSelected ? Colors.white : Colors.indigo[900],
-                              fontWeight: FontWeight.bold,
-                            ),
-                            avatar: Icon(Icons.local_parking,
-                                color: isSelected ? Colors.white : Colors.indigo),
-                            onSelected: (_) {
-                              if (bookedSpotKey == null) _onManualSpotSelect(spot);
-                            },
-                          );
-                        },
+                  // Draggable handle (visual cue only)
+                  if (selectedSpot == null || bookedSpotKey == null)
+                    Container(
+                      width: 40,
+                      height: 4,
+                      margin: const EdgeInsets.only(bottom: 6),
+                      decoration: BoxDecoration(
+                        color: Colors.teal[400],
+                        borderRadius: BorderRadius.circular(2),
                       ),
                     ),
-                  if (selectedSpot != null)
+                  // Only show radius slider and chips if not booked
+                  if (bookedSpotKey == null)
+                    Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        // Radius slider (only if not booked)
+                        //if (selectedSpot == null)
+                          Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 12),
+                            child: Row(
+                              children: [
+                                const Text(
+                                  'Radius:',
+                                  style: TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 14,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                                const SizedBox(width: 6),
+                                Expanded(
+                                  child: SliderTheme(
+                                    data: SliderTheme.of(context).copyWith(
+                                      trackHeight: 4,
+                                      trackShape: const RoundedRectSliderTrackShape(),
+                                      activeTrackColor: Colors.teal[400],
+                                      inactiveTrackColor: Colors.grey[700],
+                                      thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 8),
+                                      thumbColor: Colors.white,
+                                      overlayColor: Colors.teal.withOpacity(0.2),
+                                    ),
+                                    child: Slider(
+                                      min: 0,
+                                      max: 4000,
+                                      value: searchRadius,
+                                      divisions: 40,
+                                      onChanged: (value) {
+                                        setState(() {
+                                          searchRadius = value;
+                                        });
+                                        _updateNearbyParkingSpots(forceNearest: true);
+                                      },
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(width: 6),
+                                Text(
+                                  '${searchRadius.toInt()} m',
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 14,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        // Spot selection chips (only if not booked)
+                        SizedBox(
+                          height: 50,
+                          child: ListView.separated(
+                            scrollDirection: Axis.horizontal,
+                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                            itemCount: nearbyParkingSpots.length,
+                            separatorBuilder: (_, __) => const SizedBox(width: 6),
+                            itemBuilder: (context, idx) {
+                              final spot = nearbyParkingSpots[idx];
+                              final isSelected = spot == selectedSpot;
+                              return ChoiceChip(
+                                label: Text(
+                                  spot.name,
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 14,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                                selected: isSelected,
+                                selectedColor: Colors.teal[400],
+                                backgroundColor: Colors.grey[700],
+                                avatar: Icon(
+                                  Icons.local_parking,
+                                  color: isSelected ? Colors.white : Colors.white,
+                                  size: 16,
+                                ),
+                                onSelected: (_) {
+                                  if (bookedSpotKey == null) _onManualSpotSelect(spot);
+                                },
+                              );
+                            },
+                          ),
+                        ),
+                        // "Book" button (only if not booked and spot selected)
+                        if (selectedSpot != null && bookedSpotKey == null)
+                          Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Text(
+                                  "${selectedSpot!.name} (${selectedSpot!.capacity})",
+                                  style: const TextStyle(
+                                    fontSize: 14,
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.w500,
+                                  ),
+                                  textAlign: TextAlign.center,
+                                ),
+                                const SizedBox(height: 4),
+                                Row(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    SizedBox(
+                                      width: 140,
+                                      height: 44,
+                                      child: ElevatedButton.icon(
+                                        icon: const Icon(Icons.event_seat, size: 18),
+                                        label: const Text("Book", style: TextStyle(fontSize: 16)),
+                                        style: ElevatedButton.styleFrom(
+                                          backgroundColor: Colors.teal[400],
+                                          foregroundColor: Colors.white,
+                                          padding: const EdgeInsets.symmetric(horizontal: 8),
+                                          shape: RoundedRectangleBorder(
+                                            borderRadius: BorderRadius.circular(14),
+                                          ),
+                                        ),
+                                        onPressed: () async {
+                                          if (selectedSpot != null && currentLocation != null) {
+                                            final result = await Navigator.push(
+                                              context,
+                                              MaterialPageRoute(
+                                                builder: (context) => BookingScreen(
+                                                  spot: selectedSpot!,
+                                                ),
+                                              ),
+                                            );
+                                            if (result == true) {
+                                              await _refreshBookingState();
+                                            }
+                                          }
+                                        },
+                                      ),
+                                    ),
+                                    const SizedBox(width: 12),
+                                    SizedBox(
+                                      width: 140,
+                                      height: 44,
+                                      child: ElevatedButton.icon(
+                                        icon: const Icon(Icons.cancel, size: 18),
+                                        label: const Text("Cancel", style: TextStyle(fontSize: 16)),
+                                        style: ElevatedButton.styleFrom(
+                                          backgroundColor: Colors.grey[700],
+                                          foregroundColor: Colors.white,
+                                          padding: const EdgeInsets.symmetric(horizontal: 8),
+                                          shape: RoundedRectangleBorder(
+                                            borderRadius: BorderRadius.circular(14),
+                                          ),
+                                        ),
+                                        onPressed: () async {
+                                          final result = await Navigator.push(
+                                            context,
+                                            MaterialPageRoute(
+                                              builder: (context) => BookingScreen(
+                                                spot: selectedSpot!,
+                                                isCancel: true,
+                                              ),
+                                            ),
+                                          );
+                                          if (result == true) {
+                                            await _refreshBookingState();
+                                          }
+                                        },
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ],
+                            ),
+                          ),
+                      ],
+                    ),
+                  // When booked, only show spot info and "Cancel" button
+                  if (bookedSpotKey != null && selectedSpot != null)
                     Padding(
-                      padding: const EdgeInsets.only(top: 10, left: 10, right: 10, bottom: 4),
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
                       child: Column(
+                        mainAxisSize: MainAxisSize.min,
                         children: [
                           Text(
-                            "Navigating to: ${selectedSpot!.name} (Capacity: ${selectedSpot!.capacity})",
+                            "Navigating to: ${selectedSpot!.name}",
                             style: const TextStyle(
-                              fontSize: 16,
-                              color: Colors.indigo,
+                              fontSize: 14,
+                              color: Colors.white,
                               fontWeight: FontWeight.w500,
                             ),
                             textAlign: TextAlign.center,
                           ),
-                          const SizedBox(height: 8),
-                          Row(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              SizedBox(
-                                width: 140,
-                                height: 48,
-                                child: ElevatedButton.icon(
-                                  icon: const Icon(Icons.event_seat),
-                                  label: const Text("Book"),
-                                  onPressed: (bookedSpotKey != null)
-                                      ? null
-                                      : () async {
-                                    if (selectedSpot != null && currentLocation != null) {
-                                      final result = await Navigator.push(
-                                        context,
-                                        MaterialPageRoute(
-                                          builder: (context) => BookingScreen(
-                                            spot: selectedSpot!,
-                                          ),
-                                        ),
-                                      );
-                                      if (result == true) {
-                                        await _refreshBookingState();
-                                      }
-                                    }
-                                  },
+                          const SizedBox(height: 4),
+                          SizedBox(
+                            width: 140,
+                            height: 44,
+                            child: ElevatedButton.icon(
+                              icon: const Icon(Icons.cancel, size: 18),
+                              label: const Text("Cancel", style: TextStyle(fontSize: 16)),
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: Colors.grey[700],
+                                foregroundColor: Colors.white,
+                                padding: const EdgeInsets.symmetric(horizontal: 8),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(14),
                                 ),
                               ),
-                              const SizedBox(width: 16),
-                              SizedBox(
-                                width: 140,
-                                height: 48,
-                                child: ElevatedButton.icon(
-                                  icon: const Icon(Icons.cancel),
-                                  label: const Text("Cancel"),
-                                  style: ElevatedButton.styleFrom(backgroundColor: Colors.black),
-                                  onPressed: (bookedSpotKey == null)
-                                      ? null
-                                      : () async {
-                                    final result = await Navigator.push(
-                                      context,
-                                      MaterialPageRoute(
-                                        builder: (context) => BookingScreen(
-                                          spot: selectedSpot!,
-                                          isCancel: true,
-                                        ),
-                                      ),
-                                    );
-                                    if (result == true) {
-                                      await _refreshBookingState();
-                                    }
-                                  },
-                                ),
-                              ),
-                            ],
+                              onPressed: () async {
+                                final result = await Navigator.push(
+                                  context,
+                                  MaterialPageRoute(
+                                    builder: (context) => BookingScreen(
+                                      spot: selectedSpot!,
+                                      isCancel: true,
+                                    ),
+                                  ),
+                                );
+                                if (result == true) {
+                                  await _refreshBookingState();
+                                }
+                              },
+                            ),
                           ),
                         ],
                       ),
@@ -636,7 +752,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: const [
-                    CircularProgressIndicator(color: Colors.indigo),
+                    CircularProgressIndicator(color: Colors.teal),
                     SizedBox(height: 12),
                     Text("Routing...", style: TextStyle(color: Colors.white)),
                   ],
@@ -647,5 +763,5 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
     );
   }
-}
 
+}

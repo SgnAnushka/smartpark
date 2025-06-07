@@ -66,7 +66,7 @@ class _BookingScreenState extends State<BookingScreen> {
     // Reduce capacity by 1
     await ref.child('${widget.spot.key}/capacity').set(cap - 1);
 
-    // Save booking info locally (store all relevant fields)
+    // Save booking info locally
     final prefs = await SharedPreferences.getInstance();
     final now = DateTime.now();
     final endTime = now.add(Duration(hours: bookingDuration)).millisecondsSinceEpoch;
@@ -106,7 +106,6 @@ class _BookingScreenState extends State<BookingScreen> {
     await Future.delayed(const Duration(seconds: 1));
     Navigator.pop(context, true);
   }
-
 
   Future<void> _cancelBooking() async {
     setState(() { isProcessing = true; });
@@ -157,8 +156,14 @@ class _BookingScreenState extends State<BookingScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      backgroundColor: Colors.grey[900]?.withOpacity(0.97),
       appBar: AppBar(
-        title: Text(widget.isCancel ? "Cancel Booking" : "Book Parking Spot"),
+        backgroundColor: Colors.grey[900]?.withOpacity(0.97),
+        title: Text(
+          widget.isCancel ? "Cancel Booking" : "Book Parking Spot",
+          style: const TextStyle(color: Colors.white),
+        ),
+        iconTheme: const IconThemeData(color: Colors.white),
       ),
       body: Padding(
         padding: const EdgeInsets.all(24.0),
@@ -167,17 +172,31 @@ class _BookingScreenState extends State<BookingScreen> {
           children: [
             Text(
               widget.spot.name,
-              style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: Colors.indigo),
+              style: const TextStyle(
+                fontSize: 24,
+                fontWeight: FontWeight.bold,
+                color: Colors.white,
+              ),
             ),
             const SizedBox(height: 24),
             if (!widget.isCancel) ...[
               TextField(
                 controller: _controller,
                 keyboardType: TextInputType.number,
-                decoration: const InputDecoration(
+                decoration: InputDecoration(
                   labelText: "Booking Duration (hours)",
-                  border: OutlineInputBorder(),
+                  labelStyle: const TextStyle(color: Colors.white70),
+                  border: OutlineInputBorder(
+                    borderSide: BorderSide(color: Colors.teal[400]!),
+                  ),
+                  enabledBorder: OutlineInputBorder(
+                    borderSide: BorderSide(color: Colors.teal[400]!),
+                  ),
+                  focusedBorder: OutlineInputBorder(
+                    borderSide: BorderSide(color: Colors.teal[400]!),
+                  ),
                 ),
+                style: const TextStyle(color: Colors.white),
                 onChanged: (val) {
                   final parsed = int.tryParse(val);
                   setState(() {
@@ -192,7 +211,7 @@ class _BookingScreenState extends State<BookingScreen> {
                 child: ElevatedButton(
                   onPressed: (isProcessing || bookingDuration <= 0) ? null : _bookSpot,
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.indigo,
+                    backgroundColor: Colors.teal[400],
                     foregroundColor: Colors.white,
                     textStyle: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
                   ),
@@ -210,7 +229,7 @@ class _BookingScreenState extends State<BookingScreen> {
                 child: ElevatedButton(
                   onPressed: isProcessing ? null : _cancelBooking,
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.red,
+                    backgroundColor: Colors.grey[700],
                     foregroundColor: Colors.white,
                     textStyle: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
                   ),
@@ -219,7 +238,7 @@ class _BookingScreenState extends State<BookingScreen> {
                       : const Text("Cancel Booking"),
                 ),
               ),
-            ]
+            ],
           ],
         ),
       ),
