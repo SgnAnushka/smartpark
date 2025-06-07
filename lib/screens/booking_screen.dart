@@ -3,6 +3,7 @@ import 'package:firebase_database/firebase_database.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../model/parkingspot_model.dart';
+import '/apis/booking_api.dart';
 
 class BookingScreen extends StatefulWidget {
   final ParkingSpot spot;
@@ -31,126 +32,24 @@ class _BookingScreenState extends State<BookingScreen> {
   }
 
   Future<void> _restoreBookingState() async {
-    final prefs = await SharedPreferences.getInstance();
-    final userId = FirebaseAuth.instance.currentUser?.uid;
-    if (userId == null || prefs.getString('booked_spot_key') != null) return;
-
-    final activeBooking = await FirebaseDatabase.instance
-        .ref('user_booking_history/$userId')
-        .orderByChild('status')
-        .equalTo('active')
-        .once();
-
-    if (activeBooking.snapshot.value != null) {
-      final bookingEntry = (activeBooking.snapshot.value as Map<dynamic, dynamic>).entries.first;
-      final bookingData = bookingEntry.value as Map<dynamic, dynamic>;
-      await prefs.setString('booked_spot_key', bookingData['slotKey']);
-      await prefs.setString('last_booking_id', bookingEntry.key);
-    }
+    await BookingAPI.restoreBookingState(context, widget.spot);
   }
 
   Future<void> _bookSpot() async {
-    setState(() { isProcessing = true; });
-
-    final ref = FirebaseDatabase.instance.ref('parking_lots');
-    final spotSnap = await ref.child(widget.spot.key).get();
-    int? cap = spotSnap.child('capacity').value is int ? spotSnap.child('capacity').value as int : null;
-    if (cap == null || cap <= 0) {
-      setState(() { isProcessing = false; });
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Spot not available.')),
-      );
-      return;
-    }
-
-    // Reduce capacity by 1
-    await ref.child('${widget.spot.key}/capacity').set(cap - 1);
-
-    // Save booking info locally
-    final prefs = await SharedPreferences.getInstance();
-    final now = DateTime.now();
-    final endTime = now.add(Duration(hours: bookingDuration)).millisecondsSinceEpoch;
-    await prefs.setString('booked_spot_key', widget.spot.key);
-    await prefs.setString('booked_spot_name', widget.spot.name);
-    await prefs.setDouble('booked_spot_lat', widget.spot.location.latitude);
-    await prefs.setDouble('booked_spot_lng', widget.spot.location.longitude);
-    await prefs.setInt('booked_spot_capacity', widget.spot.capacity);
-    await prefs.setInt('booking_end_time', endTime);
-
-    // Save booking history in Firebase
-    final user = FirebaseAuth.instance.currentUser!;
-    final userId = user.uid;
-    final userEmail = user.email ?? '';
-    final historyRef = FirebaseDatabase.instance.ref('user_booking_history/$userId');
-    final newBookingRef = historyRef.push();
-
-    await newBookingRef.set({
-      'userEmail': userEmail,
-      'date': "${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}",
-      'startTime': now.millisecondsSinceEpoch,
-      'endTime': endTime,
-      'slotKey': widget.spot.key,
-      'slotName': widget.spot.name,
-      'slotLat': widget.spot.location.latitude,
-      'slotLng': widget.spot.location.longitude,
-      'durationHours': bookingDuration,
-      'status': 'active',
-    });
-    // Store bookingId for later cancellation/completion
-    await prefs.setString('last_booking_id', newBookingRef.key!);
-
-    setState(() { isProcessing = false; });
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Slot booked!')),
+    await BookingAPI.bookSpot(
+      context,
+      widget.spot,
+      bookingDuration,
+      _controller,
+          (val) => setState(() { isProcessing = val; }),
     );
-    await Future.delayed(const Duration(seconds: 1));
-    Navigator.pop(context, true);
   }
 
   Future<void> _cancelBooking() async {
-    setState(() { isProcessing = true; });
-
-    final prefs = await SharedPreferences.getInstance();
-    final spotKey = prefs.getString('booked_spot_key');
-    final bookingId = prefs.getString('last_booking_id');
-    if (spotKey == null) {
-      setState(() { isProcessing = false; });
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('No booking found.')),
-      );
-      return;
-    }
-    final ref = FirebaseDatabase.instance.ref('parking_lots');
-    final capSnap = await ref.child('$spotKey/capacity').get();
-    int? cap = capSnap.value is int ? capSnap.value as int : null;
-    if (cap == null) cap = 0;
-    await ref.child('$spotKey/capacity').set(cap + 1);
-
-    // Update booking history status in Firebase
-    if (bookingId != null) {
-      final userId = FirebaseAuth.instance.currentUser!.uid;
-      final bookingRef = FirebaseDatabase.instance
-          .ref('user_booking_history/$userId/$bookingId');
-      await bookingRef.update({
-        'status': 'cancelled',
-        'cancelledAt': DateTime.now().millisecondsSinceEpoch,
-      });
-      await prefs.remove('last_booking_id');
-    }
-
-    await prefs.remove('booked_spot_key');
-    await prefs.remove('booked_spot_name');
-    await prefs.remove('booked_spot_lat');
-    await prefs.remove('booked_spot_lng');
-    await prefs.remove('booked_spot_capacity');
-    await prefs.remove('booking_end_time');
-
-    setState(() { isProcessing = false; });
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Booking cancelled.')),
+    await BookingAPI.cancelBooking(
+      context,
+          (val) => setState(() { isProcessing = val; }),
     );
-    await Future.delayed(const Duration(seconds: 1));
-    Navigator.pop(context, true);
   }
 
   @override
@@ -187,13 +86,13 @@ class _BookingScreenState extends State<BookingScreen> {
                   labelText: "Booking Duration (hours)",
                   labelStyle: const TextStyle(color: Colors.white70),
                   border: OutlineInputBorder(
-                    borderSide: BorderSide(color: Colors.teal[400]!),
+                    borderSide: BorderSide(color: Colors.teal),
                   ),
                   enabledBorder: OutlineInputBorder(
-                    borderSide: BorderSide(color: Colors.teal[400]!),
+                    borderSide: BorderSide(color: Colors.teal),
                   ),
                   focusedBorder: OutlineInputBorder(
-                    borderSide: BorderSide(color: Colors.teal[400]!),
+                    borderSide: BorderSide(color: Colors.teal),
                   ),
                 ),
                 style: const TextStyle(color: Colors.white),
@@ -211,7 +110,7 @@ class _BookingScreenState extends State<BookingScreen> {
                 child: ElevatedButton(
                   onPressed: (isProcessing || bookingDuration <= 0) ? null : _bookSpot,
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.teal[400],
+                    backgroundColor: Colors.teal,
                     foregroundColor: Colors.white,
                     textStyle: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
                   ),
@@ -229,7 +128,7 @@ class _BookingScreenState extends State<BookingScreen> {
                 child: ElevatedButton(
                   onPressed: isProcessing ? null : _cancelBooking,
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.grey[700],
+                    backgroundColor: Colors.grey,
                     foregroundColor: Colors.white,
                     textStyle: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
                   ),

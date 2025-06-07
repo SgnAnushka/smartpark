@@ -7,10 +7,12 @@ import 'package:geolocator/geolocator.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:firebase_database/firebase_database.dart';
+import 'package:flutter_compass/flutter_compass.dart';
 import '../model/parkingspot_model.dart';
 import '/screens/bookhis_screen.dart';
 import 'booking_screen.dart';
 import 'dart:math' as math;
+import '../apis/parking_api.dart';
 
 class HomeScreen extends StatefulWidget {
   final User user;
@@ -37,227 +39,182 @@ class _HomeScreenState extends State<HomeScreen> {
   List<ParkingSpot> nearbyParkingSpots = [];
   StreamSubscription<Position>? positionStreamSubscription;
   StreamSubscription<DatabaseEvent>? firebaseSub;
+  StreamSubscription<CompassEvent>? compassStreamSubscription;
 
   Set<Marker> markers = {};
   Set<Polyline> polylines = {};
 
   String? bookedSpotKey;
   Timer? _bookingExpiryTimer;
+  bool userSelectedSpot = false;
+
+  // Compass and animation variables
+  double userHeading = 0.0;
+  double userTurns = 0.0;
+  double prevHeading = 0.0;
+
+  // FIXED: Cache custom marker to prevent flickering
+  BitmapDescriptor? _cachedUserMarker;
+  Timer? _markerUpdateTimer;
 
   @override
   void initState() {
     super.initState();
-    _getPermissionAndLocation();
-    _listenToParkingSpots();
-    _startBookingExpiryTimer();
-    _refreshBookingState();
+
+    ParkingApi.getPermissionAndLocation(
+          (loc) => setState(() => currentLocation = loc),
+          (loading, error) => setState(() {
+        isLoading = loading;
+        errorMessage = error;
+      }),
+          () => _updateNearbyParkingSpots(forceNearest: true),
+          (newLoc) {
+        setState(() => currentLocation = newLoc);
+        // FIXED: Throttle location-based updates
+        _throttledUpdateNearbySpots();
+      },
+          (sub) => positionStreamSubscription = sub,
+    );
+
+    ParkingApi.listenToParkingSpots(
+          (spots) => setState(() => allParkingSpots = spots),
+          () => _updateNearbyParkingSpots(forceNearest: true),
+          () => _checkBooking(),
+    );
+
+    _bookingExpiryTimer = ParkingApi.startBookingExpiryTimer(() async {
+      await _refreshBookingState();
+    });
+
     _restoreBookingStateFromFirebase();
+    _setupCompass();
   }
+
+  // FIXED: Throttled updates to prevent constant refreshing
+  void _throttledUpdateNearbySpots() {
+    _markerUpdateTimer?.cancel();
+    _markerUpdateTimer = Timer(const Duration(milliseconds: 500), () {
+      if (!userSelectedSpot) {
+        _updateNearbyParkingSpots();
+      } else {
+        // Just update markers without changing selection
+        _updateMarkersOnly();
+      }
+    });
+  }
+
+  void _setupCompass() {
+    compassStreamSubscription = ParkingApi.setupCompassListener((newHeading) {
+      setState(() {
+        userTurns = ParkingApi.calculateSmoothTurns(newHeading, prevHeading, userTurns);
+        prevHeading = userHeading;
+        userHeading = newHeading;
+      });
+      // FIXED: Only update user marker rotation, not all markers
+      _updateUserMarkerRotation();
+    });
+  }
+
+  // FIXED: Update only user marker rotation without recreating everything
+  void _updateUserMarkerRotation() {
+    if (currentLocation != null && markers.isNotEmpty) {
+      final existingMarkers = Set<Marker>.from(markers);
+
+      // FIXED: Use firstWhere instead of indexWhere for Set
+      try {
+        final userMarker = existingMarkers.firstWhere(
+              (m) => m.markerId.value == 'user',
+        );
+
+        // Remove the old marker
+        existingMarkers.remove(userMarker);
+
+        // Add updated marker with new rotation
+        existingMarkers.add(userMarker.copyWith(
+          rotationParam: userHeading,
+        ));
+
+        setState(() {
+          markers = existingMarkers;
+        });
+      } catch (e) {
+        // User marker not found, do nothing
+      }
+    }
+  }
+
 
   @override
   void dispose() {
     positionStreamSubscription?.cancel();
     firebaseSub?.cancel();
     _bookingExpiryTimer?.cancel();
+    compassStreamSubscription?.cancel();
+    _markerUpdateTimer?.cancel();
     super.dispose();
   }
 
-  void _startBookingExpiryTimer() {
-    _bookingExpiryTimer?.cancel();
-    _bookingExpiryTimer = Timer.periodic(const Duration(seconds: 10), (timer) async {
-      await _refreshBookingState();
-    });
-  }
-
-  Future<void> _refreshBookingState() async {
-    await checkAndHandleBookingExpiration();
-    await _checkBooking();
-    setState(() {});
-  }
-
-  Future<void> _restoreBookingStateFromFirebase() async {
-    final prefs = await SharedPreferences.getInstance();
-    final userId = FirebaseAuth.instance.currentUser?.uid;
-    if (userId == null || prefs.getString('booked_spot_key') != null) return;
-
-    final activeBooking = await FirebaseDatabase.instance
-        .ref('user_booking_history/$userId')
-        .orderByChild('status')
-        .equalTo('active')
-        .once();
-
-    if (activeBooking.snapshot.value != null) {
-      final bookingEntry = (activeBooking.snapshot.value as Map<dynamic, dynamic>).entries.first;
-      final bookingData = bookingEntry.value as Map<dynamic, dynamic>;
-      await prefs.setString('booked_spot_key', bookingData['slotKey']);
-      await prefs.setString('last_booking_id', bookingEntry.key);
-      await prefs.setString('booked_spot_name', bookingData['slotName']);
-      await prefs.setDouble('booked_spot_lat', bookingData['slotLat']);
-      await prefs.setDouble('booked_spot_lng', bookingData['slotLng']);
-      await prefs.setInt('booked_spot_capacity', bookingData['capacity'] ?? 0);
-      await prefs.setInt('booking_end_time', bookingData['endTime']);
-    }
-  }
-
-  Future<void> checkAndHandleBookingExpiration() async {
-    final prefs = await SharedPreferences.getInstance();
-    final bookingEndTime = prefs.getInt('booking_end_time');
-    final spotKey = prefs.getString('booked_spot_key');
-    final bookingId = prefs.getString('last_booking_id');
-    final userId = FirebaseAuth.instance.currentUser?.uid;
-
-    if (bookingEndTime != null && spotKey != null && userId != null && bookingId != null) {
-      final now = DateTime.now().millisecondsSinceEpoch;
-      if (now >= bookingEndTime) {
-        // 1. Restore capacity
-        final ref = FirebaseDatabase.instance.ref('parking_lots/$spotKey/capacity');
-        final capSnap = await ref.get();
-        int cap = capSnap.value is int ? capSnap.value as int : 0;
-        await ref.set(cap + 1);
-
-        // 2. Update booking history status to 'completed'
-        final bookingRef = FirebaseDatabase.instance
-            .ref('user_booking_history/$userId/$bookingId');
-        await bookingRef.update({
-          'status': 'completed',
-          'completedAt': now,
-        });
-
-        // 3. Clear booking state
-        await prefs.remove('booked_spot_key');
-        await prefs.remove('booked_spot_name');
-        await prefs.remove('booked_spot_lat');
-        await prefs.remove('booked_spot_lng');
-        await prefs.remove('booked_spot_capacity');
-        await prefs.remove('booking_end_time');
-        await prefs.remove('last_booking_id');
-      }
-    }
-  }
-
-  Future<void> _checkBooking() async {
-    final prefs = await SharedPreferences.getInstance();
-    final key = prefs.getString('booked_spot_key');
-    setState(() {
-      bookedSpotKey = key;
-      if (key != null) {
-        selectedSpot = allParkingSpots.firstWhere(
-              (spot) => spot.key == key,
-          orElse: () {
-            final name = prefs.getString('booked_spot_name') ?? '';
-            final lat = prefs.getDouble('booked_spot_lat') ?? 0.0;
-            final lng = prefs.getDouble('booked_spot_lng') ?? 0.0;
-            final cap = prefs.getInt('booked_spot_capacity') ?? 0;
-            return ParkingSpot(
-              key: key,
-              name: name,
-              location: LatLng(lat, lng),
-              capacity: cap,
-            );
-          },
-        );
-        if (selectedSpot != null && currentLocation != null) {
-          _getRoute(currentLocation!, selectedSpot!.location);
-        }
-      }
-    });
-  }
-
-  void _listenToParkingSpots() {
-    final ref = FirebaseDatabase.instance.ref('parking_lots');
-    firebaseSub = ref.onValue.listen((DatabaseEvent event) {
-      final data = event.snapshot.value as Map<dynamic, dynamic>?;
-      if (data == null) {
-        setState(() {
-          allParkingSpots = [];
-        });
-        _updateNearbyParkingSpots(forceNearest: true);
-        return;
-      }
-      final spots = <ParkingSpot>[];
-      data.forEach((key, value) {
-        if (value is Map<dynamic, dynamic>) {
-          spots.add(ParkingSpot.fromMap(value, key));
-          }
-          });
-      setState(() {
-        allParkingSpots = spots;
-      });
-      _updateNearbyParkingSpots(forceNearest: true);
-      _checkBooking();
-    });
-  }
-
-  Future<void> _getPermissionAndLocation() async {
-    setState(() {
-      isLoading = true;
-      errorMessage = null;
-    });
-    try {
-      await Geolocator.requestPermission();
-      Position position = await Geolocator.getCurrentPosition(
-        desiredAccuracy: LocationAccuracy.high,
-      );
-      setState(() {
-        currentLocation = LatLng(position.latitude, position.longitude);
-        isLoading = false;
-      });
-      _updateNearbyParkingSpots(forceNearest: true);
-      positionStreamSubscription = Geolocator.getPositionStream(
-        locationSettings: LocationSettings(
-          accuracy: LocationAccuracy.high,
-          distanceFilter: 10,
-        ),
-      ).listen((Position newPosition) {
-        setState(() {
-          currentLocation = LatLng(newPosition.latitude, newPosition.longitude);
-        });
-        _updateNearbyParkingSpots();
-        if (selectedSpot != null) {
-          _getRoute(currentLocation!, selectedSpot!.location);
-        }
-        _updateInstructionIndex();
-      });
-    } catch (e) {
-      setState(() {
-        currentLocation = LatLng(24.953514, 84.011787);
-        errorMessage = "Failed to get location. Using default location.";
-        isLoading = false;
-      });
-      _updateNearbyParkingSpots(forceNearest: true);
-    }
-  }
-
+  // FIXED: Better logic for preserving manual selection
   void _updateNearbyParkingSpots({bool forceNearest = false}) {
     if (currentLocation == null) return;
+
+    final previousNearbySpots = List<ParkingSpot>.from(nearbyParkingSpots);
+
     setState(() {
       nearbyParkingSpots = allParkingSpots.where((spot) {
-        return _calculateDistance(currentLocation!, spot.location) <= searchRadius && spot.isAvailable;
+        return ParkingApi.calculateDistance(currentLocation!, spot.location) <= searchRadius && spot.isAvailable;
       }).toList();
     });
+
     if (bookedSpotKey == null) {
-      if (forceNearest || selectedSpot == null || !nearbyParkingSpots.contains(selectedSpot)) {
-        if (nearbyParkingSpots.isNotEmpty) {
-          _selectNearestSpot();
-        } else {
+      // FIXED: Better preservation of manual selection
+      if (userSelectedSpot && selectedSpot != null) {
+        // If user manually selected a spot, only change if it's no longer available
+        if (!nearbyParkingSpots.contains(selectedSpot)) {
+          // Selected spot is no longer nearby, reset
           setState(() {
             selectedSpot = null;
+            userSelectedSpot = false;
             routePoints = [];
             navigationInstructions = [];
             currentInstructionIndex = 0;
           });
+          if (nearbyParkingSpots.isNotEmpty) {
+            _selectNearestSpot();
+          }
+        }
+      } else {
+        // No manual selection or forced update
+        if (forceNearest || selectedSpot == null || !nearbyParkingSpots.contains(selectedSpot)) {
+          if (nearbyParkingSpots.isNotEmpty) {
+            _selectNearestSpot();
+          } else {
+            setState(() {
+              selectedSpot = null;
+              routePoints = [];
+              navigationInstructions = [];
+              currentInstructionIndex = 0;
+              userSelectedSpot = false;
+            });
+          }
         }
       }
     }
-    _updateMarkers();
+    _updateMarkersOnly();
   }
 
   void _selectNearestSpot() {
-    if (currentLocation == null || nearbyParkingSpots.isEmpty) return;
+    if (currentLocation == null || nearbyParkingSpots.isEmpty) {
+      setState(() {
+        selectedSpot = null;
+        userSelectedSpot = false;
+      });
+      return;
+    }
     ParkingSpot? closest;
     double minDist = double.infinity;
     for (var spot in nearbyParkingSpots) {
-      double dist = _calculateDistance(currentLocation!, spot.location);
+      double dist = ParkingApi.calculateDistance(currentLocation!, spot.location);
       if (dist < minDist) {
         minDist = dist;
         closest = spot;
@@ -270,11 +227,13 @@ class _HomeScreenState extends State<HomeScreen> {
         routePoints = [];
         navigationInstructions = [];
         currentInstructionIndex = 0;
+        // Keep userSelectedSpot as false for auto-selection
       });
       _getRoute(currentLocation!, selectedSpot!.location);
     }
   }
 
+  // FIXED: Ensure manual selection is preserved
   void _onManualSpotSelect(ParkingSpot spot) {
     if (bookedSpotKey != null) return;
     setState(() {
@@ -283,148 +242,79 @@ class _HomeScreenState extends State<HomeScreen> {
       routePoints = [];
       navigationInstructions = [];
       currentInstructionIndex = 0;
+      userSelectedSpot = true; // IMPORTANT: Mark as manually selected
     });
-    _getRoute(currentLocation!, spot.location);
+    if (currentLocation != null) {
+      _getRoute(currentLocation!, spot.location);
+    }
   }
 
-  double _calculateDistance(LatLng a, LatLng b) {
-    const p = 0.017453292519943295;
-    final c = (double x) => math.cos(x);
-    final d = (double x) => math.sin(x);
-    final lat1 = a.latitude * p;
-    final lat2 = b.latitude * p;
-    final a1 = d((lat2 - lat1) / 2);
-    final a2 = d((b.longitude - a.longitude) * p / 2);
-    final a3 = a1 * a1 + c(lat1) * c(lat2) * a2 * a2;
-    return 12742 * math.asin(math.sqrt(a3)) * 1000; // in meters
+  // FIXED: Separate method for updating markers without selection logic
+  void _updateMarkersOnly() {
+    ParkingApi.updateMarkers(
+      currentLocation,
+      nearbyParkingSpots,
+      selectedSpot,
+      bookedSpotKey,
+      userHeading,
+      userTurns,
+          (m) => setState(() => markers = m),
+    );
   }
 
   Future<void> _getRoute(LatLng start, LatLng end) async {
-    const apiKey = String.fromEnvironment('API_KEY');
-    final url =
-        'https://maps.googleapis.com/maps/api/directions/json?origin=${start.latitude},${start.longitude}&destination=${end.latitude},${end.longitude}&mode=driving&key=$apiKey';
-    try {
-      final response = await http.get(Uri.parse(url));
-      if (response.statusCode == 200) {
-        final data = json.decode(response.body);
-        if (data['routes'] != null && data['routes'].isNotEmpty) {
-          final route = data['routes'][0];
-          final polyline = route['overview_polyline']['points'];
-          final List<LatLng> points = _decodePolyline(polyline);
-          setState(() {
-            routePoints = points;
-            isRouting = false;
-          });
-          _updatePolylines();
-        } else {
-          setState(() {
-            routePoints = [];
-            isRouting = false;
-            errorMessage = "No route found.";
-          });
-        }
-      } else {
-        setState(() {
-          routePoints = [];
-          isRouting = false;
-          errorMessage = "Failed to fetch route.";
-        });
-      }
-    } catch (e) {
-      setState(() {
-        routePoints = [];
-        isRouting = false;
-        errorMessage = "Error fetching route.";
-      });
-    }
+    await ParkingApi.getRoute(
+      start,
+      end,
+          (points, routing) => setState(() {
+        routePoints = points;
+        isRouting = routing;
+      }),
+          () => ParkingApi.updatePolylines(
+        routePoints,
+            (p) => setState(() => polylines = p),
+      ),
+          (err) => setState(() => errorMessage = err),
+    );
   }
 
-  List<LatLng> _decodePolyline(String polyline) {
-    List<LatLng> result = [];
-    int index = 0, len = polyline.length;
-    int lat = 0, lng = 0;
-    while (index < len) {
-      int b, shift = 0, resultInt = 0;
-      do {
-        b = polyline.codeUnitAt(index++) - 63;
-        resultInt |= (b & 0x1f) << shift;
-        shift += 5;
-      } while (b >= 0x20);
-      int dlat = ((resultInt & 1) != 0 ? ~(resultInt >> 1) : (resultInt >> 1));
-      lat += dlat;
-      shift = 0;
-      resultInt = 0;
-      do {
-        b = polyline.codeUnitAt(index++) - 63;
-        resultInt |= (b & 0x1f) << shift;
-        shift += 5;
-      } while (b >= 0x20);
-      int dlng = ((resultInt & 1) != 0 ? ~(resultInt >> 1) : (resultInt >> 1));
-      lng += dlng;
-      result.add(LatLng(lat / 1E5, lng / 1E5));
-    }
-    return result;
+  Future<void> _refreshBookingState() async {
+    final prefs = await SharedPreferences.getInstance();
+    await ParkingApi.checkAndHandleBookingExpiration(
+      prefs,
+      prefs.getString('booked_spot_key'),
+      prefs.getInt('booking_end_time'),
+      prefs.getString('last_booking_id'),
+      FirebaseAuth.instance.currentUser?.uid,
+    );
+    await _checkBooking();
+    setState(() {});
   }
 
-  void _updateMarkers() {
-    Set<Marker> newMarkers = {};
-    if (currentLocation != null) {
-      newMarkers.add(
-        Marker(
-          markerId: const MarkerId('user'),
-          position: currentLocation!,
-          icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueAzure),
-          infoWindow: const InfoWindow(title: 'You'),
-        ),
-      );
-    }
-    for (var spot in nearbyParkingSpots) {
-      newMarkers.add(
-        Marker(
-          markerId: MarkerId(spot.name),
-          position: spot.location,
-          icon: BitmapDescriptor.defaultMarkerWithHue(
-            spot == selectedSpot ? BitmapDescriptor.hueOrange : BitmapDescriptor.hueGreen,
-          ),
-          infoWindow: InfoWindow(
-            title: spot.name,
-            snippet: 'Capacity: ${spot.capacity}',
-            onTap: () {
-              if (bookedSpotKey != null) _onManualSpotSelect(spot);
-            },
-          ),
-        ),
-      );
-    }
-    setState(() {
-      markers = newMarkers;
-    });
+  Future<void> _restoreBookingStateFromFirebase() async {
+    await ParkingApi.restoreBookingStateFromFirebase(context);
   }
 
-  void _updatePolylines() {
-    Set<Polyline> newPolys = {};
-    if (routePoints.isNotEmpty) {
-      newPolys.add(
-        Polyline(
-          polylineId: const PolylineId('route'),
-          color: Colors.blue,
-          width: 6,
-          points: routePoints,
-        ),
-      );
-    }
-    setState(() {
-      polylines = newPolys;
-    });
+  Future<void> _checkBooking() async {
+    final prefs = await SharedPreferences.getInstance();
+    await ParkingApi.checkBooking(
+      prefs,
+      allParkingSpots,
+      currentLocation,
+          (key, spot) => setState(() {
+        bookedSpotKey = key;
+        selectedSpot = spot;
+        userSelectedSpot = false;
+      }),
+          (start, end) => _getRoute(start, end),
+    );
   }
 
   void _updateInstructionIndex() {}
 
   Future<void> _logout() async {
-    await FirebaseAuth.instance.signOut();
+    await ParkingApi.logout();
   }
-
-  // ... (all your imports and class/state definitions above remain the same)
 
   @override
   Widget build(BuildContext context) {
@@ -436,7 +326,6 @@ class _HomeScreenState extends State<HomeScreen> {
         titleTextStyle: const TextStyle(
           color: Colors.teal,
           fontSize: 20,
-          //fontWeight: FontWeight.bold,
         ),
         actions: [
           IconButton(
@@ -461,8 +350,7 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         ],
       ),
-
-        body: isLoading || currentLocation == null
+      body: isLoading || currentLocation == null
           ? const Center(child: CircularProgressIndicator())
           : Stack(
         children: [
@@ -472,13 +360,29 @@ class _HomeScreenState extends State<HomeScreen> {
               zoom: 16,
             ),
             mapType: mapType,
-            myLocationEnabled: true,
+            myLocationEnabled: false,
             myLocationButtonEnabled: true,
             markers: markers,
             polylines: polylines,
             onMapCreated: (controller) => mapController = controller,
+            onTap: (latLng) {
+              if (bookedSpotKey == null) {
+                ParkingSpot? tappedSpot = nearbyParkingSpots.firstWhere(
+                      (spot) =>
+                  ParkingApi.calculateDistance(latLng, spot.location) < 30,
+                  orElse: () => ParkingSpot(
+                    key: '',
+                    name: '',
+                    location: latLng,
+                    capacity: 0,
+                  ),
+                );
+                if (tappedSpot.key.isNotEmpty) {
+                  _onManualSpotSelect(tappedSpot);
+                }
+              }
+            },
           ),
-          // Bottom pop-up (always visible)
           Positioned(
             bottom: 0,
             left: 0,
@@ -499,7 +403,6 @@ class _HomeScreenState extends State<HomeScreen> {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  // Draggable handle (visual cue only)
                   if (selectedSpot == null || bookedSpotKey == null)
                     Container(
                       width: 40,
@@ -510,64 +413,61 @@ class _HomeScreenState extends State<HomeScreen> {
                         borderRadius: BorderRadius.circular(2),
                       ),
                     ),
-                  // Only show radius slider and chips if not booked
                   if (bookedSpotKey == null)
                     Column(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        // Radius slider (only if not booked)
-                        //if (selectedSpot == null)
-                          Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 12),
-                            child: Row(
-                              children: [
-                                const Text(
-                                  'Radius:',
-                                  style: TextStyle(
-                                    color: Colors.white,
-                                    fontSize: 14,
-                                    fontWeight: FontWeight.bold,
+                        Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 12),
+                          child: Row(
+                            children: [
+                              const Text(
+                                'Radius:',
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 14,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                              const SizedBox(width: 6),
+                              Expanded(
+                                child: SliderTheme(
+                                  data: SliderTheme.of(context).copyWith(
+                                    trackHeight: 4,
+                                    trackShape: const RoundedRectSliderTrackShape(),
+                                    activeTrackColor: Colors.teal[400],
+                                    inactiveTrackColor: Colors.grey[700],
+                                    thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 8),
+                                    thumbColor: Colors.white,
+                                    overlayColor: Colors.teal.withOpacity(0.2),
+                                  ),
+                                  child: Slider(
+                                    min: 0,
+                                    max: 4000,
+                                    value: searchRadius,
+                                    divisions: 40,
+                                    onChanged: (value) {
+                                      setState(() {
+                                        searchRadius = value;
+                                        userSelectedSpot = false; // Reset manual selection on radius change
+                                      });
+                                      _updateNearbyParkingSpots(forceNearest: true);
+                                    },
                                   ),
                                 ),
-                                const SizedBox(width: 6),
-                                Expanded(
-                                  child: SliderTheme(
-                                    data: SliderTheme.of(context).copyWith(
-                                      trackHeight: 4,
-                                      trackShape: const RoundedRectSliderTrackShape(),
-                                      activeTrackColor: Colors.teal[400],
-                                      inactiveTrackColor: Colors.grey[700],
-                                      thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 8),
-                                      thumbColor: Colors.white,
-                                      overlayColor: Colors.teal.withOpacity(0.2),
-                                    ),
-                                    child: Slider(
-                                      min: 0,
-                                      max: 4000,
-                                      value: searchRadius,
-                                      divisions: 40,
-                                      onChanged: (value) {
-                                        setState(() {
-                                          searchRadius = value;
-                                        });
-                                        _updateNearbyParkingSpots(forceNearest: true);
-                                      },
-                                    ),
-                                  ),
+                              ),
+                              const SizedBox(width: 6),
+                              Text(
+                                '${searchRadius.toInt()} m',
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 14,
+                                  fontWeight: FontWeight.bold,
                                 ),
-                                const SizedBox(width: 6),
-                                Text(
-                                  '${searchRadius.toInt()} m',
-                                  style: const TextStyle(
-                                    color: Colors.white,
-                                    fontSize: 14,
-                                    fontWeight: FontWeight.bold,
-                                  ),
-                                ),
-                              ],
-                            ),
+                              ),
+                            ],
                           ),
-                        // Spot selection chips (only if not booked)
+                        ),
                         SizedBox(
                           height: 50,
                           child: ListView.separated(
@@ -602,7 +502,7 @@ class _HomeScreenState extends State<HomeScreen> {
                             },
                           ),
                         ),
-                        // "Book" button (only if not booked and spot selected)
+                        // FIXED: Show book button when spot is selected and not booked
                         if (selectedSpot != null && bookedSpotKey == null)
                           Padding(
                             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
@@ -691,7 +591,6 @@ class _HomeScreenState extends State<HomeScreen> {
                           ),
                       ],
                     ),
-                  // When booked, only show spot info and "Cancel" button
                   if (bookedSpotKey != null && selectedSpot != null)
                     Padding(
                       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
@@ -763,5 +662,4 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
     );
   }
-
 }
